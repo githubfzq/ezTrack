@@ -10,6 +10,7 @@ TrackLocation
 LocationThresh_View
 ROI_plot
 ROI_Location
+Object_Interaction
 Batch_LoadFiles
 Batch_Process
 PlayVideo
@@ -141,7 +142,7 @@ def LoadAndCrop(video_dict,stretch={'width':1,'height':1},cropmethod=None,fstfil
     #Set first frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, video_dict['start']) 
     ret, frame = cap.read() 
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)   
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
     cap.release()
     print('dimensions: {x}'.format(x=frame.shape))
 
@@ -386,7 +387,8 @@ def Locate(cap,reference,tracking_params,crop=None,prior=None):
             applying window weight.
         
         com:: [tuple]
-            Indices of center of mass as tuple in the form: (y,x).
+            Indices of center of mass, and axis of elongation (radians), as tuple in the 
+            form: (y,x,orientation).
         
         frame:: [numpy.array]
             Original video frame after cropping.
@@ -431,14 +433,25 @@ def Locate(cap,reference,tracking_params,crop=None,prior=None):
         #threshold differences and find center of mass for remaining values
         dif[dif<np.percentile(dif,tracking_params['loc_thresh'])]=0
         com=ndimage.measurements.center_of_mass(dif)
+        com = (com[0],com[1],getslope(dif,0))
         return ret, dif, com, frame
     
     else:
         return ret, None, None, frame
 
     
+def getslope(img,thresh):
+    points = np.stack(np.where(img>thresh)).T
+    [vy,vx,y,x] = cv2.fitLine(points = points,
+                              distType = cv2.DIST_L2,
+                              param = 0,
+                              reps = 0.01,
+                              aeps = 0.01)
+    slope = vy/vx
+    radians = np.arctan(slope) if (slope>0) else np.pi + np.arctan(slope)
     
-    
+    return radians
+       
     
 ########################################################################################        
 
@@ -485,6 +498,13 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
                 'window_weight' : 0-1 scale for window, if used, where 1 is maximal 
                                   weight of window surrounding prior locaiton. 
                                   [float between 0-1]
+                'angl_mdist' : Min distance animal must move in pixel units for change in 
+                               angle from one frame to the next to be of maximal influence.
+                               Should approximately be equal to max distance animals move
+                               from one frame to the next.
+                'angl_spd' : 0-1 scale for speed of angle change. Angle differences between
+                             frames is multiplied by this to determine change.
+              
          
         reference:: [numpy.array]
             Reference image that the current frame is compared to.
@@ -512,32 +532,47 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
     cap_max = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) 
     cap_max = int(video_dict['end']) if video_dict['end'] is not None else cap_max  
     
-    #Initialize vector to store motion values in
+    #Initialize vector to store motion/angle values in
     X = np.zeros(cap_max - video_dict['start'])
     Y = np.zeros(cap_max - video_dict['start'])
     D = np.zeros(cap_max - video_dict['start'])
+    
+    if tracking_params['angle_params']:
+        A = np.zeros(cap_max - video_dict['start'])
+        Awtd = np.zeros(cap_max - video_dict['start'])
+        Aelong = np.zeros(cap_max - video_dict['start'])
+        Afield = [np.zeros([3,2])]         
+        angle_mindist = tracking_params['angle_params']['angle_mindist'] 
+        angle_maxturn = tracking_params['angle_params']['angle_maxturn'] 
+        angle_length = tracking_params['angle_params']['angle_length']
+        angle_arc = tracking_params['angle_params']['angle_arc']   
+        arc_shift = angle_arc*0.5 #np.arctan((angle_arc*0.5)/angle_length)
+        arc_length = angle_length/np.cos(arc_shift)#np.sqrt(angle_length**2 + (angle_arc*0.5)**2)
+
 
     #Loop through frames to detect frame by frame differences
-    for f in range(len(D)):
-        
+    for f in range(len(D)):     
         if f>0: 
             yprior = np.around(Y[f-1]).astype(int)
             xprior = np.around(X[f-1]).astype(int)
             ret,dif,com,frame = Locate(cap,reference,tracking_params,crop,prior=[yprior,xprior])
         else:
             ret,dif,com,frame = Locate(cap,reference,tracking_params,crop)
-                                                
         if ret == True:          
             Y[f] = com[0]
             X[f] = com[1]
             if f>0:
                 D[f] = np.sqrt((Y[f]-Y[f-1])**2 + (X[f]-X[f-1])**2)
+                if tracking_params['angle_params']:
+                    A,Awtd,Aelong,Afield = get_orientation(f,com,D,A,Awtd,Aelong,Afield,
+                                                           X,Y,angle_mindist,angle_maxturn,
+                                                           arc_shift,arc_length)           
         else:
             #if no frame is detected
             f = f-1
-            X = X[:f] #Amend length of X vector
-            Y = Y[:f] #Amend length of Y vector
-            D = D[:f] #Amend length of D vector
+            X,Y,D = X[:f],Y[:f],D[:f]
+            if tracking_params['angle_params']:
+                A,Aw,Afield = A[:f],Aw[:f],Afield[:f]
             break   
             
     #release video
@@ -558,11 +593,54 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
      'Y': Y,
      'Distance_px': D
     })
-       
+    if tracking_params['angle_params']:
+        df['Angle'] = Aelong
+        df['Angle_field'] = Afield
+                                       
+    
     return df
 
 
+def Triangulate(v0,angle,arc_shift,arc_length):   
+    shift_p = angle + arc_shift
+    shift_n = angle - arc_shift
+    v1 = (np.cos(shift_p)*arc_length + v0[0], 
+          np.sin(shift_p)*arc_length + v0[1])
 
+    v2 = (np.cos(shift_n)*arc_length + v0[0], 
+          np.sin(shift_n)*arc_length + v0[1])
+    triangle = np.array([v0,v1,v2])
+    return triangle
+
+def get_distangle(x,y):
+    x = np.finfo(float).eps if (x==0) else x
+    if x>=0:
+        angle = np.arctan(y/x) if (y>=0) else 2*np.pi + np.arctan(y/x)
+    else:
+        angle = np.pi + np.arctan(y/x)
+    return angle
+
+def get_orientation(f,com,D,A,Awtd,Aelong,Afield,X,Y,angle_mindist,angle_maxturn,arc_shift,arc_length):
+    Aelong[f] = com[2]
+    A[f] = get_distangle((X[f]-X[f-1]), (Y[f]-Y[f-1]))
+    Awtd[f] = A[f] if (D[f] > angle_mindist) else Awtd[f-1]                    
+    #check that distance angle does not exceed max shift allowed
+    Adif1 = np.rad2deg(max([Awtd[f],Awtd[f-1]]) - min([Awtd[f],Awtd[f-1]]))
+    if (Adif1 > angle_maxturn) and ((360-Adif1) > angle_maxturn):
+        Awtd[f]= Awtd[f-1] 
+    #define orientation of angle of elongation based upon distance angle
+    Adif2 = np.rad2deg(max([Awtd[f],Aelong[f]]) - min([Awtd[f],Aelong[f]]))
+    if (Adif2 > 90) and ((360-Adif2) > 90):
+        Aelong[f] = Aelong[f] + np.pi
+    #check that elongation angle does flip entirely from one frame to the next
+    Adif3 = np.rad2deg(max([Aelong[f],Aelong[f-1]]) - min([Aelong[f],Aelong[f-1]]))
+    if (Adif3 > 170) and ((360-Adif3) > 170):
+        Aelong[f] = Aelong[f] + np.pi if Aelong[f] < np.pi else Aelong[f] - np.pi
+    Afield.append(Triangulate(v0 = [X[f],Y[f]],
+                              angle = Aelong[f],
+                              arc_shift = arc_shift,
+                              arc_length = arc_length))
+    return A,Awtd,Aelong,Afield 
 
 
 ########################################################################################
@@ -748,7 +826,7 @@ def ROI_plot(reference,region_names,stretch={'width':1,'height':1}):
               invert_yaxis=True,cmap='gray',
               colorbar=True,
                toolbar='below',
-              title="No Regions to Draw" if nobjects == 0 else "Draw Regions: "+', '.join(region_names))
+              title="Nothing to Draw" if nobjects == 0 else "Draw: "+', '.join(region_names))
 
     #Create polygon element on which to draw and connect via stream to PolyDraw drawing tool
     poly = hv.Polygons([])
@@ -826,8 +904,8 @@ def ROI_Location(reference,location,region_names,poly_stream):
         y = np.array(poly_stream.data['ys'][poly]) #y coordinates
         xy = np.column_stack((x,y)).astype('uint64') #xy coordinate pairs
         mask = np.zeros(reference.shape) # create empty mask
-        cv2.fillPoly(mask, pts =[xy], color=255) #fill polygon  
-        ROI_masks[region_names[poly]] = mask==255 #save to ROI masks as boolean 
+        mask = cv2.fillPoly(mask, pts =[xy], color=1).astype('bool') #fill polygon  
+        ROI_masks[region_names[poly]] = mask #save to ROI masks as boolean 
 
     #Create arrays to store whether animal is within given ROI
     ROI_location = {}
@@ -853,9 +931,79 @@ def ROI_Location(reference,location,region_names,poly_stream):
 
 
 
+########################################################################################    
+
+def Object_Interaction(reference,location,object_names,poly_stream):
+    """ 
+    -------------------------------------------------------------------------------------
+    
+    For each frame, determine which object of interest the animal is interacting with.  For 
+    each object, boolean array is added to `location` dataframe passed, with 
+    column name being the object name.
+    
+    -------------------------------------------------------------------------------------
+    Args:
+        reference:: [numpy.array]
+            Reference image that the current frame is compared to.
+        
+        location:: [pandas.dataframe]
+            Pandas dataframe with frame by frame x and y locations,
+            distance travelled, as well as video information and parameter values. 
+            Must contain column names 'X' and 'Y'.
+                                                
+        object_names:: [list]
+            List containing names of drawn object.  Should be set to None if no
+            regions are used.
+            
+        poly_stream:: [holoviews.streams.stream]
+            Holoviews stream object enabling dynamic selection in response to 
+            selection tool. `poly_stream.data` contains x and y coordinates of roi 
+            vertices.
+    
+    -------------------------------------------------------------------------------------
+    Returns:
+        location:: [pandas.dataframe]
+            For each object of interest, boolean array is added to `location` dataframe 
+            passed, with column name being the object name.
+                                      
+    -------------------------------------------------------------------------------------
+    Notes:
+    
+    """
+
+    #Create object masks
+    Object_masks = {}
+    for poly in range(len(poly_stream.data['xs'])):
+        x = np.array(poly_stream.data['xs'][poly]) #x coordinates
+        y = np.array(poly_stream.data['ys'][poly]) #y coordinates
+        xy = np.column_stack((x,y)).astype('uint64') #xy coordinate pairs
+        mask = np.zeros(reference.shape) # create empty mask
+        cv2.fillPoly(mask, pts =[xy], color=1) #fill polygon  
+        Object_masks[object_names[poly]] = mask #save to ROI masks as boolean 
+
+    #Create arrays to store whether animal is interacting with object/s
+    Object_int = {}
+    for mask in Object_masks:
+        Object_int[mask]=np.full(len(location['Frame']),False,dtype=bool)
+
+    #For each frame assess truth of animal interacting with each object
+    for f in location['Frame']:
+        field_mask = np.zeros(reference.shape) 
+        field_mask = cv2.fillPoly(field_mask,[location['Angle_field'][f].astype('int')],color=1).astype('bool')
+        for mask in Object_int:
+            Object_int[mask][f] = True if Object_masks[mask][field_mask].sum()>0 else False
+            
+    #Add data to location and return
+    for name in object_names: location[name] = Object_int[name]
+    return location
+
+
+
+
+
 ########################################################################################        
     
-def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
+def Summarize_Location(location, video_dict, bin_dict=None, region_names=None, object_names=None):
     """ 
     -------------------------------------------------------------------------------------
     
@@ -894,7 +1042,11 @@ def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
             example: bin_dict = {1:(0,100), 2:(100,200)}                             
             
         region_names:: [list]
-            List containing names of regions to be drawn.  Should be set to None if no
+            List containing names of drawn regions.  Should be set to None if no
+            regions are used.
+        
+        object_names:: [list]
+            List containing names of drawn objects.  Should be set to None if no
             regions are used.
     
     -------------------------------------------------------------------------------------
@@ -920,18 +1072,27 @@ def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
             .reset_index().rename(columns=dict(index='bin')))    
     bins['Distance_px'] = bins['range(f)'].apply(
         lambda r: location[location['Frame'].between(*r)]['Distance_px'].sum())
-    if region_names is not None:
+    
+    names = [] 
+    for item in [region_names,object_names]:
+        names = names + item if (item!=None) else names
+    names = None if len(names)==0 else names
+    print(names)
+    
+    if names is not None:
         bins_reg = bins['range(f)'].apply(
-            lambda r: location[location['Frame'].between(*r)][region_names].mean())
+            lambda r: location[location['Frame'].between(*r)][names].mean())
         bins = bins.join(bins_reg)
-        drp_cols = ['Distance_px', 'Frame', 'X', 'Y'] + region_names
+        drp_cols = ['Distance_px', 'Frame', 'X', 'Y'] + names
     else:
         drp_cols = ['Distance_px', 'Frame', 'X', 'Y']
+        
     bins = pd.merge(
         location.drop(drp_cols, axis='columns'),
         bins,
         left_index=True,
         right_index=True)
+    bins.drop(['Angle','Angle_field'],axis='columns',inplace=True) if 'Angle' in bins.columns else None
     
     return bins
 
@@ -1003,7 +1164,7 @@ def Batch_LoadFiles(video_dict):
 
 def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None, 
                   stretch={'width':1,'height':1}, scale_dict=None, dist=None, 
-                  crop=None,poly_stream=None):   
+                  crop=None,roi_stream=None,object_stream=None):   
     """ 
     -------------------------------------------------------------------------------------
     
@@ -1086,10 +1247,15 @@ def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,
             cropping tool. `crop.data` contains x and y coordinates of crop
             boundary vertices.
             
-        poly_stream:: [holoviews.streams.stream]
+        roi_stream:: [holoviews.streams.stream]
             Holoviews stream object enabling dynamic selection in response to 
             selection tool. `poly_stream.data` contains x and y coordinates of roi 
             vertices.    
+        
+        object_stream:: [holoviews.streams.stream]
+            Holoviews stream object enabling dynamic selection in response to 
+            selection tool. `poly_stream.data` contains x and y coordinates of roi 
+            vertices.   
     
     -------------------------------------------------------------------------------------
     Returns:
@@ -1119,12 +1285,15 @@ def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,
         reference,image = Reference(video_dict,crop=crop,num_frames=100) 
         location = TrackLocation(video_dict,tracking_params,reference,crop=crop)
         
-        if region_names!=None:
-            location = ROI_Location(reference,location,region_names,poly_stream)
+        if object_names != None:
+            location = lt.Object_Interaction(reference,location,object_names,object_stream) 
+        if region_names != None: 
+            location = lt.ROI_Location(reference,location,region_names,roi_stream) 
         if scale_dict!=None:
             location = ScaleDistance(scale_dict, dist, df=location, column='Distance_px')
         location.to_csv(os.path.splitext(video_dict['fpath'])[0] + '_LocationOutput.csv')
-        file_summary = Summarize_Location(location, video_dict, bin_dict=bin_dict, region_names=region_names)
+        file_summary = Summarize_Location(location,video_dict,bin_dict=bin_dict,
+                                          region_names=region_names,object_names=object_names)
                
         try: 
             summary_all = pd.concat([summary_all,file_summary],sort=False)
@@ -1223,6 +1392,10 @@ def PlayVideo(video_dict,display_dict,location,crop=None):
         if ret == True:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frame = cropframe(frame, crop)
+            if 'Angle_field' in location.columns:
+                cv2.fillPoly(frame,
+                             [location['Angle_field'][f].astype('int')],
+                             color=255)
             markposition = (int(location['X'][f]),int(location['Y'][f]))
             cv2.drawMarker(img=frame,position=markposition,color=255)
             cv2.imshow("preview",frame)
