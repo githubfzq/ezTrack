@@ -538,14 +538,16 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
     D = np.zeros(cap_max - video_dict['start'])
     
     if tracking_params['angle_params']:
+        start_ang = np.deg2rad(tracking_params['angle_params']['angle_start'])
         A = np.zeros(cap_max - video_dict['start'])
         Awtd = np.zeros(cap_max - video_dict['start'])
         Aelong = np.zeros(cap_max - video_dict['start'])
-        Afield = [np.zeros([3,2])]         
+        Afield = [np.zeros([3,2])]  
+        A[0],Awtd[0],Aelong[0] = start_ang,start_ang,start_ang
         angle_mindist = tracking_params['angle_params']['angle_mindist'] 
-        angle_maxturn = tracking_params['angle_params']['angle_maxturn'] 
+        angle_maxturn = 135 #tracking_params['angle_params']['angle_maxturn'] 
         angle_length = tracking_params['angle_params']['angle_length']
-        angle_arc = tracking_params['angle_params']['angle_arc']   
+        angle_arc = np.deg2rad(tracking_params['angle_params']['angle_arc'])   
         arc_shift = angle_arc*0.5 #np.arctan((angle_arc*0.5)/angle_length)
         arc_length = angle_length/np.cos(arc_shift)#np.sqrt(angle_length**2 + (angle_arc*0.5)**2)
 
@@ -578,6 +580,7 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
     #release video
     cap.release()
     print('total frames processed: {f}'.format(f=len(D)))
+    print('median pix dist.: {}'.format(D.mean()))
     
     #create pandas dataframe
     df = pd.DataFrame(
@@ -634,7 +637,7 @@ def get_orientation(f,com,D,A,Awtd,Aelong,Afield,X,Y,angle_mindist,angle_maxturn
         Aelong[f] = Aelong[f] + np.pi
     #check that elongation angle does flip entirely from one frame to the next
     Adif3 = np.rad2deg(max([Aelong[f],Aelong[f-1]]) - min([Aelong[f],Aelong[f-1]]))
-    if (Adif3 > 170) and ((360-Adif3) > 170):
+    if (Adif3 > 178) and ((360-Adif3) > 178):
         Aelong[f] = Aelong[f] + np.pi if Aelong[f] < np.pi else Aelong[f] - np.pi
     Afield.append(Triangulate(v0 = [X[f],Y[f]],
                               angle = Aelong[f],
@@ -1393,9 +1396,9 @@ def PlayVideo(video_dict,display_dict,location,crop=None):
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frame = cropframe(frame, crop)
             if 'Angle_field' in location.columns:
-                cv2.fillPoly(frame,
+                cv2.polylines(frame, 
                              [location['Angle_field'][f].astype('int')],
-                             color=255)
+                             isClosed=True,color=255)
             markposition = (int(location['X'][f]),int(location['Y'][f]))
             cv2.drawMarker(img=frame,position=markposition,color=255)
             cv2.imshow("preview",frame)
