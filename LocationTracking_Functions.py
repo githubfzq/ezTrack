@@ -1080,7 +1080,6 @@ def Summarize_Location(location, video_dict, bin_dict=None, region_names=None, o
     for item in [region_names,object_names]:
         names = names + item if (item!=None) else names
     names = None if len(names)==0 else names
-    print(names)
     
     if names is not None:
         bins_reg = bins['range(f)'].apply(
@@ -1165,7 +1164,7 @@ def Batch_LoadFiles(video_dict):
         
 ######################################################################################## 
 
-def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None, 
+def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,object_names=None, 
                   stretch={'width':1,'height':1}, scale_dict=None, dist=None, 
                   crop=None,roi_stream=None,object_stream=None):   
     """ 
@@ -1289,9 +1288,9 @@ def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,
         location = TrackLocation(video_dict,tracking_params,reference,crop=crop)
         
         if object_names != None:
-            location = lt.Object_Interaction(reference,location,object_names,object_stream) 
+            location = Object_Interaction(reference,location,object_names,object_stream) 
         if region_names != None: 
-            location = lt.ROI_Location(reference,location,region_names,roi_stream) 
+            location = ROI_Location(reference,location,region_names,roi_stream) 
         if scale_dict!=None:
             location = ScaleDistance(scale_dict, dist, df=location, column='Distance_px')
         location.to_csv(os.path.splitext(video_dict['fpath'])[0] + '_LocationOutput.csv')
@@ -1305,7 +1304,7 @@ def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,
         if scale_dict!=None:
             summary_all = ScaleDistance(scale_dict, dist, df=summary_all, column='Distance_px')
         
-        trace = showtrace(reference,location,poly_stream,stretch=stretch)
+        trace = showtrace(reference,location,roi_stream,stretch=stretch)
         heatmap = Heatmap(reference, location, sigma=None, stretch=stretch)
         images = images + [(trace.opts(title=file)), (heatmap.opts(title=file))]
 
