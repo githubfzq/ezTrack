@@ -1629,4 +1629,47 @@ def ScaleDistance(scale_dict, dist=None, df=None, column=None):
 #bokeh_obj.output_backend = 'svg'
 #export_svgs(bokeh_obj, dpath + '/' + 'Calibration_Frame.svg')
 
+
+
+########################################################################################
+
+def Summary_Cross(location):
+    """
+    ---------------------------------------------------
+
+    Generates summary of ROI-crossing times.
+
+    ---------------------------------------------------
+
+    Args:
+        location::[pandas.dataframe]
+            Pandas dataframe with frame by frame x and y locations,
+            distance travelled, as well as video information and parameter values. 
+            Additionally, for each region of interest, boolean array indicating whether 
+            animal is in the given region for each frame.
     
+    -----------------------------------------------------
+
+    Returns:
+        result::[pandas.dataframe]
+            Pandas dataframe with transition direction ('Region_From', 'Region_To') 
+            and crossing times ('Cross_n').
+    """
+
+    res = pd.concat([location[['Frame']],location.select_dtypes(bool)], axis=1)
+    res = res.melt(id_vars='Frame',var_name='Region', value_name='IsInRegion')
+    res = res.groupby('Region').apply(
+        lambda x: x.drop(columns='Region').assign(
+            Cross=x.IsInRegion.astype('int').diff().map({1:'To',-1:'From'})
+        )
+    )
+    res = res[~res.Cross.isnull()]
+    res=(res.reset_index(0).sort_values('Frame').groupby('Cross')
+        .apply(lambda x:x.drop(columns='Cross')
+        .assign(CrossID=np.arange(1,x.shape[0]+1)))
+        .reset_index(0))
+    res=res.pivot(index='CrossID',columns='Cross',values=['Region','Frame'])
+    res.columns = res.columns.map(lambda s: s[0]+'_'+s[1])
+    res = (res.groupby(['Region_From','Region_To']).Frame_To.count()
+            .reset_index().rename(columns={'Frame_To':'Cross_n'}))
+    return res
