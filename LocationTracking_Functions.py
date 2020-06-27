@@ -514,6 +514,7 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
     #load video
     cap = cv2.VideoCapture(video_dict['fpath'])#set file
     cap.set(cv2.CAP_PROP_POS_FRAMES,video_dict['start']) #set starting frame
+    fps = cap.get(cv2.CAP_PROP_FPS)
     cap_max = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) 
     cap_max = int(video_dict['end']) if video_dict['end'] is not None else cap_max  
     
@@ -552,6 +553,7 @@ def TrackLocation(video_dict,tracking_params,reference,crop=None):
     #create pandas dataframe
     df = pd.DataFrame(
     {'File' : video_dict['file'],
+     'FPS':fps,
      'Location_Thresh': np.ones(len(D))*tracking_params['loc_thresh'],
      'Use_Window': str(tracking_params['use_window']),
      'Window_Weight': np.ones(len(D))*tracking_params['window_weight'],
@@ -859,7 +861,8 @@ def ROI_Location(reference,location,region_names,poly_stream):
 
 ########################################################################################        
     
-def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
+def Summarize_Location(location, video_dict, bin_dict=None, region_names=None,
+    time_bin=False,n_bins_mode='fixed',cross=None):
     """ 
     -------------------------------------------------------------------------------------
     
@@ -900,6 +903,17 @@ def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
         region_names:: [list]
             List containing names of regions to be drawn.  Should be set to None if no
             regions are used.
+
+        time_bin::[logical]
+            Time minutes for each bin. Default is `False`, use bin_dict. If set `True`,
+            `bin_dict` value will be regarded as time rather than frame.
+
+        n_bin_mode::{'fixed','auto'}
+            Specific whether `bin_dict` length is fixed or adjusted.
+
+        cross::[pandas.dataframe]
+            Pandas dataframe with result of each cross-region event and frame.
+            If none, result will not summary cross-region times. Default is `None`.
     
     -------------------------------------------------------------------------------------
     Returns:
@@ -917,6 +931,17 @@ def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
     #define bins
     avg_dict = {'all': (location['Frame'].min(), location['Frame'].max())}   
     bin_dict = bin_dict if bin_dict is not None else avg_dict
+    fps = location['FPS'][0]
+    if time_bin:
+        bin_dict={k:(v[0]*60*fps,v[1]*60*fps) for k,v in bin_dict.items()}
+        if n_bins_mode=='auto':
+            k,v = list(bin_dict.keys())[-1], list(bin_dict.values())[-1]
+            step = v[1]
+            v = step
+            while v<avg_dict['all'][1]:
+                k+=1
+                bin_dict.update({k:(v,v+step)})
+                v+=step
     #bin_dict = {k: tuple((np.array(v) * video_dict['fps']).tolist()) for k, v in bin_dict.items()}
     
     #get summary info
@@ -936,6 +961,16 @@ def Summarize_Location(location, video_dict, bin_dict=None, region_names=None):
         bins,
         left_index=True,
         right_index=True)
+    if cross is None:
+        cross, _ = Summary_Cross(location)
+    bins['Cross_Region'] = bins['range(f)'].apply(
+        lambda r: cross['Frame_To'].between(*r).sum()
+    )
+    if time_bin:
+        bins['range(f)'] = bins['range(f)'].apply(
+            lambda r:(r[0]/(fps*60),r[1]/(fps*60))
+        )
+        bins = bins.rename(columns={'range(f)':'range(t)/min'})
     
     return bins
 
@@ -1007,7 +1042,7 @@ def Batch_LoadFiles(video_dict):
 
 def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None, 
                   stretch={'width':1,'height':1}, scale_dict=None, dist=None, 
-                  crop=None,poly_stream=None):   
+                  crop=None,poly_stream=None,time_bin=False,n_bins_mode='fixed'):   
     """ 
     -------------------------------------------------------------------------------------
     
@@ -1093,7 +1128,14 @@ def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,
         poly_stream:: [holoviews.streams.stream]
             Holoviews stream object enabling dynamic selection in response to 
             selection tool. `poly_stream.data` contains x and y coordinates of roi 
-            vertices.    
+            vertices.
+
+        time_bin::[logical]
+            Time minutes for each bin. Default is `False`, use bin_dict. If set `True`,
+            `bin_dict` value will be regarded as time rather than frame.
+
+        n_bin_mode::{'fixed','auto'}
+            Specific whether `bin_dict` length is fixed or adjusted.
     
     -------------------------------------------------------------------------------------
     Returns:
@@ -1128,7 +1170,8 @@ def Batch_Process(video_dict,tracking_params,bin_dict,region_names=None,
         if scale_dict!=None:
             location = ScaleDistance(scale_dict, dist, df=location, column='Distance_px')
         location.to_csv(os.path.splitext(video_dict['fpath'])[0] + '_LocationOutput.csv')
-        file_summary = Summarize_Location(location, video_dict, bin_dict=bin_dict, region_names=region_names)
+        file_summary = Summarize_Location(location, video_dict, bin_dict=bin_dict, region_names=region_names,
+                                        time_bin=time_bin,n_bins_mode=n_bins_mode)
                
         try: 
             summary_all = pd.concat([summary_all,file_summary],sort=False)
@@ -1668,8 +1711,10 @@ def Summary_Cross(location):
         .apply(lambda x:x.drop(columns='Cross')
         .assign(CrossID=np.arange(1,x.shape[0]+1)))
         .reset_index(0))
-    res=res.pivot(index='CrossID',columns='Cross',values=['Region','Frame'])
-    res.columns = res.columns.map(lambda s: s[0]+'_'+s[1])
-    res = (res.groupby(['Region_From','Region_To']).Frame_To.count()
+    res1=res.pivot(index='CrossID',columns='Cross',values=['Region','Frame'])
+    res1.columns = res1.columns.map(lambda s: s[0]+'_'+s[1])
+    res2 = (res1.groupby(['Region_From','Region_To']).Frame_To.count()
             .reset_index().rename(columns={'Frame_To':'Cross_n'}))
-    return res
+    return res1,res2
+
+######################################################################################## 
